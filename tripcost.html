@@ -694,6 +694,12 @@
 
   var FUEL_LABELS = { benzin:"Benzín", nafta:"Nafta", lpg:"LPG", elektro:"Elektro" };
 
+  /* safe own-property lookup (blocks keys like "constructor" / "__proto__" coming from imported files) */
+  function hasOwn(o, k){ return typeof k === "string" && Object.prototype.hasOwnProperty.call(o, k); }
+  function fuelLabelOf(t){ return hasOwn(FUEL_LABELS, t) ? FUEL_LABELS[t] : String(t); }
+  /* number from untrusted input: finite, >= 0, capped */
+  function numIn(v, max){ v = parseFloat(v); return (isFinite(v) && v >= 0) ? Math.min(v, max) : 0; }
+
   function normalizeUrl(u){
     u = (typeof u === "string" ? u : "").trim();
     if(!u) return "";
@@ -708,9 +714,9 @@
   var CURRENCIES = { CZK:"Kč", EUR:"€", USD:"$", GBP:"£", PLN:"zł" };
   var DEFAULT_CUR = "CZK";
   var currency = DEFAULT_CUR;
-  function sym(code){ return CURRENCIES[code || currency] || CURRENCIES[DEFAULT_CUR]; }
+  function sym(code){ var k = code || currency; return hasOwn(CURRENCIES, k) ? CURRENCIES[k] : CURRENCIES[DEFAULT_CUR]; }
   function guessCurrency(o){
-    if(o && CURRENCIES[o.currency]) return o.currency;
+    if(o && hasOwn(CURRENCIES, o.currency)) return o.currency;
     // routes/state saved before currencies existed: Czech version = Kč, English = $ — tell them apart by price level
     var p = num(o && o.price);
     if(!(p > 0)) return DEFAULT_CUR;
@@ -748,7 +754,7 @@
   }
 
   function setFuel(type){
-    if(!FUEL_UNITS[type]) type = "benzin";
+    if(!hasOwn(FUEL_UNITS, type)) type = "benzin";
     fuelType = type;
     var btns = els.fuelSeg.querySelectorAll(".fuel-btn");
     for(var i=0;i<btns.length;i++){
@@ -980,7 +986,7 @@
   function loadRoutes(){
     try {
       var r = JSON.parse(localStorage.getItem(STORAGE_ROUTES));
-      return Array.isArray(r) ? r.filter(function(x){ return x && typeof x === "object"; }) : [];
+      return Array.isArray(r) ? r.filter(function(x){ return x && typeof x === "object"; }).map(function(x){ if(!hasOwn(FUEL_UNITS, x.fuelType)) x.fuelType = "benzin"; return x; }) : [];
     } catch(e){ return []; }
   }
 
@@ -997,7 +1003,7 @@
     var html = "";
     for(var i=0;i<routes.length;i++){
       var r = routes[i];
-      var fuelLabel = FUEL_LABELS[r.fuelType] || r.fuelType;
+      var fuelLabel = escapeHtml(fuelLabelOf(r.fuelType));
       var mapBtn = r.mapLink
         ? '<a class="rc-map" href="'+escapeHtml(normalizeUrl(r.mapLink))+'" target="_blank" rel="noopener" aria-label="Otevřít trasu na mapě"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/></svg></a>'
         : '';
@@ -1087,7 +1093,9 @@
   /* ---- export: CSV + PDF ---- */
   function csvEscape(v){
     v = String(v === null || v === undefined ? "" : v);
-    if(/[;"\n]/.test(v)) v = '"' + v.replace(/"/g, '""') + '"';
+    // CSV/formula injection: text starting with = + - @ (or tab/CR) would be run as a formula in Excel/Sheets; plain numbers stay as they are
+    if(/^[=+\-@\t\r]/.test(v) && !/^-?[\d\s.,]+$/.test(v)) v = "'" + v;
+    if(/[;"\n\r]/.test(v)) v = '"' + v.replace(/"/g, '""') + '"';
     return v;
   }
 
@@ -1119,7 +1127,7 @@
     var S = sym(lastCalc.currency);
     var rows = [
       ["Pole", "Hodnota"],
-      ["Typ pohonu", FUEL_LABELS[lastCalc.fuelType] || lastCalc.fuelType],
+      ["Typ pohonu", fuelLabelOf(lastCalc.fuelType)],
       ["Vzdálenost (km)", fmt(lastCalc.totalKm, 1)],
       ["Tam a zpět", lastCalc.roundTrip ? "Ano" : "Ne"],
       ["Průměrná spotřeba", fmt(lastCalc.consumption, 1) + " " + u.cons],
@@ -1142,7 +1150,7 @@
     var rows = [["Název", "Typ pohonu", "Vzdálenost (km)", "Tam a zpět", "Spotřeba", "Cena paliva", "Počet osob", "Další náklady", "Celkové náklady", "Měna", "Odkaz na mapu"]];
     routes.forEach(function(r){
       rows.push([
-        r.name, FUEL_LABELS[r.fuelType] || r.fuelType, fmtN(r.distance), r.roundTrip ? "Ano" : "Ne",
+        r.name, fuelLabelOf(r.fuelType), fmtN(r.distance), r.roundTrip ? "Ano" : "Ne",
         fmtN(r.consumption), fmtN(r.price), r.passengers, fmt(r.extra || 0, 2), fmt(r.totalCost, 2), guessCurrency(r), r.mapLink ? normalizeUrl(r.mapLink) : ""
       ]);
     });
@@ -1165,19 +1173,21 @@
   });
 
   function isValidRoute(r){
-    return r && typeof r === "object" && r.name && r.fuelType && isFinite(parseFloat(r.distance)) && isFinite(parseFloat(r.consumption)) && isFinite(parseFloat(r.price));
+    return r && typeof r === "object" && r.name && typeof r.fuelType === "string" && isFinite(parseFloat(r.distance)) && isFinite(parseFloat(r.consumption)) && isFinite(parseFloat(r.price));
   }
 
   els.importRoutesFile.addEventListener("change", function(){
     var file = this.files && this.files[0];
     if(!file) return;
+    if(file.size > 1024 * 1024){ showToast("Soubor je příliš velký (max 1 MB)"); return; }
     var reader = new FileReader();
     reader.onload = function(){
       var data;
       try { data = JSON.parse(reader.result); } catch(e){ showToast("Soubor se nepodařilo přečíst"); return; }
+      if(!data || typeof data !== "object"){ showToast("Neplatný formát souboru"); return; }
       var incoming = Array.isArray(data) ? data : (Array.isArray(data.routes) ? data.routes : null);
       if(!incoming){ showToast("Neplatný formát souboru"); return; }
-      incoming = incoming.filter(isValidRoute);
+      incoming = incoming.slice(0, 200).filter(isValidRoute);
       if(!incoming.length){ showToast("V souboru nejsou žádné platné trasy"); return; }
 
       var existing = loadRoutes();
@@ -1193,16 +1203,16 @@
         fresh.push({
           id: id,
           name: String(r.name).slice(0,40),
-          fuelType: FUEL_UNITS[r.fuelType] ? r.fuelType : "benzin",
-          distance: parseFloat(r.distance) || 0,
+          fuelType: hasOwn(FUEL_UNITS, r.fuelType) ? r.fuelType : "benzin",
+          distance: numIn(r.distance, 1e6),
           roundTrip: !!r.roundTrip,
-          consumption: parseFloat(r.consumption) || 0,
-          price: parseFloat(r.price) || 0,
-          passengers: Math.max(1, parseInt(r.passengers,10) || 1),
-          extra: parseFloat(r.extra) || 0,
+          consumption: numIn(r.consumption, 1e3),
+          price: numIn(r.price, 1e5),
+          passengers: Math.min(30, Math.max(1, parseInt(r.passengers,10) || 1)),
+          extra: numIn(r.extra, 1e9),
           mapLink: typeof r.mapLink === "string" ? r.mapLink.slice(0, 2000) : "",
           currency: guessCurrency(r),
-          totalCost: parseFloat(r.totalCost) || 0
+          totalCost: numIn(r.totalCost, 1e12)
         });
         added++;
       });
@@ -1226,7 +1236,7 @@
     if(!lastCalc){ showToast("Nejdřív spočítejte cestu"); return; }
     var u = FUEL_UNITS[lastCalc.fuelType];
     var rowsData = [
-      ["Typ pohonu", FUEL_LABELS[lastCalc.fuelType] || lastCalc.fuelType],
+      ["Typ pohonu", fuelLabelOf(lastCalc.fuelType)],
       ["Vzdálenost", fmt(lastCalc.totalKm, lastCalc.totalKm % 1 === 0 ? 0 : 1) + " km" + (lastCalc.roundTrip ? " (tam a zpět)" : "")],
       ["Průměrná spotřeba", fmt(lastCalc.consumption, 1) + " " + u.cons],
       ["Cena paliva", fmt(lastCalc.price, 2) + " " + sym(lastCalc.currency) + "/" + u.per],
